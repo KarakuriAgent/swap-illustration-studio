@@ -45,11 +45,36 @@ def _env(name: str, default: str = "") -> str:
 
 
 def data_dir() -> Path:
-    """生成物・履歴 DB・設定の置き場（既定はリポジトリ直下の data/）。"""
+    """設定・検出モデル・一時ファイルの置き場（既定はリポジトリ直下の data/）。履歴は置かない。"""
     raw = _env("SWAP_DATA_DIR")
     path = Path(raw).expanduser() if raw else ROOT / "data"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def tmp_dir() -> Path:
+    """一時ファイルの置き場（data/tmp）。起動時に中身を消す。履歴は残さない方針なので、
+    アップロード画像・送った画像・結果はここにだけ置き、期限が来たら消す。"""
+    d = data_dir() / "tmp"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _env_path(name: str) -> Path | None:
+    raw = _env(name)
+    return Path(raw).expanduser() if raw else None
+
+
+def comfy_output_dir() -> Path | None:
+    """ローカル ComfyUI の output フォルダ（``COMFY_OUTPUT_DIR``）。設定されていれば、
+    結果を受け取ったあとに ComfyUI 側に残った生成画像を消す（ComfyUI に削除 API が無いため）。"""
+    return _env_path("COMFY_OUTPUT_DIR")
+
+
+def comfy_input_dir() -> Path | None:
+    """ローカル ComfyUI の input フォルダ（``COMFY_INPUT_DIR``）。設定されていれば、
+    アップロードした A_marked・B をジョブのあとで消す。"""
+    return _env_path("COMFY_INPUT_DIR")
 
 
 def comfy_models_dir() -> Path | None:

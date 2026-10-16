@@ -73,9 +73,21 @@ def test_detect_without_model_falls_back(client, monkeypatch):
     assert r["available"] is False and r["persons"] == [] and "手動" in r["message"]
 
 
-def test_unknown_job_404(client):
+def test_unknown_job_404_and_no_history_api(client):
     assert client.get("/api/jobs/nope").status_code == 404
-    assert client.get("/api/jobs").json() == {"jobs": []}
+    assert client.get("/api/jobs/nope/files/out.png").status_code == 404
+    assert client.delete("/api/jobs/nope").json() == {"ok": False}
+    # 履歴の一覧 API は無い
+    assert client.get("/api/jobs").status_code in (404, 405)
+
+
+def test_uploaded_images_are_temporary(client, tmp_data):
+    a = client.post("/api/images", files={"file": ("a.png", _png(), "image/png")}).json()
+    assert (tmp_data / "tmp" / "images" / f"{a['id']}.png").is_file()
+    assert client.get(a["url"]).headers["cache-control"] == "no-store"
+    from app import images
+    assert images.sweep(max_age=-1) == 1
+    assert client.get(a["url"]).status_code == 404
 
 
 def test_token_required_on_lan(monkeypatch):

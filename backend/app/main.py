@@ -13,12 +13,12 @@ from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import ValidationError
 
-from . import auth, db, detector, images, model_setup
+from . import auth, detector, images, model_setup
 from .comfy import ComfyClient, ComfyError
 from .config import (ROOT, SettingsUpdate, check_auth_config, load_settings, settings_view, token_required,
                      update_settings)
-from .jobs import compose, jobs_dir, manager, render_marked
-from .models import CropRequest, DetectRequest, GenerateRequest, LoginRequest, RerunRequest, SceneSpec
+from .jobs import compose, manager, render_marked, startup_cleanup
+from .models import CropRequest, DetectRequest, GenerateRequest, LoginRequest, SceneSpec
 
 log = logging.getLogger("swap")
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -36,15 +36,12 @@ def frontend_dist() -> Path:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     check_auth_config()
-    db.connect()
-    stale = db.mark_stale_running()
-    if stale:
-        log.info("marked %d stale jobs as interrupted", stale)
+    # 履歴は残さない: 前回の一時ファイル（アップロード画像・送った画像・結果）を消してから始める
+    startup_cleanup()
     manager.start()
     model_setup.resume_interrupted()
     yield
     await manager.stop()
-    db.close()
 
 
 app = FastAPI(title=APP_NAME, version=VERSION, lifespan=lifespan)
@@ -136,7 +133,7 @@ async def get_image(image_id: str):
         p = images.image_path(image_id)
     except images.ImageError as exc:
         raise _bad(exc, 404) from exc
-    return FileResponse(p, media_type="image/png", headers={"Cache-Control": "private, max-age=31536000, immutable"})
+    return FileResponse(p, media_type="image/png", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/images/{image_id}/info")
@@ -199,16 +196,11 @@ async def create_job(body: GenerateRequest):
         raise _bad(exc) from exc
 
 
-@app.get("/api/jobs")
-async def list_jobs(limit: int = 50, before: float | None = None):
-    return {"jobs": [manager.get(j["id"]) for j in db.list_jobs(min(limit, 200), before)]}
-
-
 @app.get("/api/jobs/{job_id}")
 async def get_job(job_id: str):
     job = manager.get(job_id)
     if job is None:
-        raise HTTPException(404, "ジョブが見つかりません")
+        raise HTTPException(404, "ジョブが見つかりません（受け取り済みか、期限切れで消えました）")
     return job
 
 
@@ -221,45 +213,22 @@ async def cancel_job(job_id: str):
     return manager.get(job_id)
 
 
-@app.post("/api/jobs/{job_id}/rerun")
-async def rerun_job(job_id: str, body: RerunRequest):
-    try:
-        return await asyncio.to_thread(manager.rerun, job_id, body)
-    except KeyError as exc:
-        raise HTTPException(404, "ジョブが見つかりません") from exc
-    except (OSError, ValueError) as exc:
-        raise _bad(exc) from exc
-
-
 @app.delete("/api/jobs/{job_id}")
-async def delete_job(job_id: str):
-    job = db.get_job(job_id)
-    if job is None:
-        raise HTTPException(404, "ジョブが見つかりません")
-    if job["status"] in ("queued", "running"):
-        raise HTTPException(409, "生成中のジョブは消せません（先に取り消してください）")
-    db.delete_job(job_id)
-    d = jobs_dir() / job_id
-    if d.is_dir() and d.parent == jobs_dir():
-        await asyncio.to_thread(__import__("shutil").rmtree, d, True)
-    return {"ok": True}
+async def discard_job(job_id: str):
+    """ブラウザが結果を受け取ったら呼ぶ。サーバー側の一時ファイル（送った画像・結果）を消す。"""
+    try:
+        ok = await asyncio.to_thread(manager.discard, job_id)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"ok": ok}
 
 
 @app.get("/api/jobs/{job_id}/files/{name}")
-async def job_file(job_id: str, name: str, download: int = 0):
-    job = db.get_job(job_id)
-    if job is None:
-        raise HTTPException(404, "ジョブが見つかりません")
-    allowed = set(job["inputs"].values()) | {r["file"] for r in job["results"]}
-    if name not in allowed:
-        raise HTTPException(404, "ファイルが見つかりません")
-    p = jobs_dir() / job_id / name
-    if not p.is_file():
-        raise HTTPException(404, "ファイルが見つかりません")
-    headers = {"Cache-Control": "private, max-age=31536000, immutable"}
-    if download:
-        return FileResponse(p, media_type="image/png", filename=f"swap_{job_id}_{name}", headers=headers)
-    return FileResponse(p, media_type="image/png", headers=headers)
+async def job_file(job_id: str, name: str):
+    p = manager.file_path(job_id, name)
+    if p is None:
+        raise HTTPException(404, "ファイルが見つかりません（受け取り済みか、期限切れで消えました）")
+    return FileResponse(p, media_type="image/png", headers={"Cache-Control": "no-store"})
 
 
 # --------------------------------------------------------------------------- セットアップ（ローカル ComfyUI）

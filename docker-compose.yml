@@ -6,7 +6,8 @@
 #
 # - 設定は .env（.env.example を写して編集）。HOST / PORT はホスト側の公開先。
 #   HOST を 127.0.0.1 以外（0.0.0.0 など）にすると LAN から使えるが、ACCESS_TOKEN が必須になる。
-# - データ（履歴 DB・画像・設定・ダウンロード状況）は ./data に置く（コンテナを作り直しても残る）。
+# - 履歴は残さない。./data には設定・ダウンロード状況・検出モデルと、一時ファイル（data/tmp。起動時と
+#   期限切れで消える）だけを置く。
 # - ローカルの ComfyUI は既定で http://host.docker.internal:8188（ホストの ComfyUI）。ComfyUI が
 #   127.0.0.1 だけで待ち受けているとコンテナから届かないので、--listen 0.0.0.0 などで起動しておく。
 # - セットアップ（モデル・LoRA のダウンロード）を使うなら .env の COMFY_MODELS_DIR に ComfyUI の models
@@ -34,6 +35,8 @@ services:
       LORA_HF_REPO: ${LORA_HF_REPO:-}
       LORA_SHA256: ${LORA_SHA256:-}
       COMFY_MODELS_DIR: ${COMFY_MODELS_DIR:-}
+      COMFY_OUTPUT_DIR: ${COMFY_OUTPUT_DIR:-}
+      COMFY_INPUT_DIR: ${COMFY_INPUT_DIR:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     ports:
       - "${HOST:-127.0.0.1}:${PORT:-2760}:2760"
@@ -41,6 +44,10 @@ services:
       - ./data:/app/data
       # ComfyUI の models フォルダ（同じ絶対パスでマウント）。未設定なら無害なダミー
       - ${COMFY_MODELS_DIR:-/tmp/swap-studio-no-models-dir}:${COMFY_MODELS_DIR:-/tmp/swap-studio-no-models-dir}
+      # ComfyUI の output / input フォルダ（任意。設定すると、ComfyUI 側に残る生成画像・アップロード画像を
+      # 結果を受け取ったあとで消す）。未設定なら無害なダミー
+      - ${COMFY_OUTPUT_DIR:-/tmp/swap-studio-no-output-dir}:${COMFY_OUTPUT_DIR:-/tmp/swap-studio-no-output-dir}
+      - ${COMFY_INPUT_DIR:-/tmp/swap-studio-no-input-dir}:${COMFY_INPUT_DIR:-/tmp/swap-studio-no-input-dir}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     init: true

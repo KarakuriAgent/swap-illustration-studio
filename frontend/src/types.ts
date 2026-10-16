@@ -103,9 +103,25 @@ export interface Job {
     face: boolean
     prompt_edited: boolean
   }
-  parent_id: string | null
   inputs: Record<string, string>
   results: JobResult[]
+}
+
+/** 今回のセッションの結果（ブラウザのメモリにだけ持つ。リロードで消える） */
+export interface SessionJob {
+  /** サーバーから取った最新の状態（受け取り後はサーバー側から消える） */
+  job: Job
+  /** 結果画像（blob: URL） */
+  results: { url: string; seed: number; elapsed: number }[]
+  /** 送った画像（blob: URL。canvas = image1、B1…） */
+  inputs: Record<string, string>
+  /** 比較用の元の A（blob: URL） */
+  original: string | null
+  size: { width: number; height: number } | null
+  /** 結果を受け取ってサーバー側を消したか */
+  received: boolean
+  /** 受け取りに失敗したときの理由 */
+  receiveError: string | null
 }
 
 export interface AppSettings {

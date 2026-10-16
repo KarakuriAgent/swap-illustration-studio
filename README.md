@@ -8,7 +8,9 @@ PC でもスマホでも使え、生成は **ローカルの ComfyUI** または
 - 枠は手で描くか、「人物を自動検出」（ローカル CPU）の候補をタップして付ける
 - 送る画像（A_marked）と英語の指示文は、**LoRA の学習データと同じ形式**でサーバー側が自動で作る
 - 枠ごとに「B の服を着せる」／「A の服装のまま」を選べる
-- 結果は元の画像と左右ドラッグで見比べ、シードや強さを変えて再生成、保存。履歴（SQLite）から設定を再利用できる
+- 結果は元の画像と左右ドラッグで見比べ、シードや強さを変えて再生成、「保存する」でダウンロード
+- **履歴は残しません**。入力も結果もサーバーには残らず、画面には今回のセッションの結果だけが出ます（後述）
+- 画面はダークテーマ（暗いグレーのパネル、明るいメインボタン、色は枠だけ）
 
 LoRA と Qwen-Image 2.1 のライセンス（Qwen Research License、非商用）は
 [LoRA の Hugging Face リポジトリ](https://huggingface.co/Kohei-Yamashita/swap-illustration-lora) の LICENSE / NOTICE を参照してください。
@@ -26,7 +28,7 @@ cp .env.example .env          # 必要なら編集（ポート・ComfyUI の mod
 ./compose.sh down             # 停止
 ```
 
-- データ（履歴 DB・アップロード画像・結果・設定）は `./data` に置かれます（コンテナを作り直しても残ります）。
+- `./data` には設定・セットアップの状況・検出モデルと、一時ファイル（`data/tmp`、起動時と期限切れで消える）だけを置きます。
 - ローカルの ComfyUI には `http://host.docker.internal:8188`（ホストの ComfyUI）でつなぎます。ComfyUI が `127.0.0.1` だけで
   待ち受けているとコンテナから届かないので、`--listen 0.0.0.0` などで起動してください（別の URL なら `.env` の `DOCKER_COMFY_URL`）。
 - `compose.sh` は `docker compose` の薄いラッパーで、ローカルユーザーの UID/GID を渡し、`./data` を先に作ります。
@@ -58,14 +60,15 @@ Python 3.12 と Node.js 18 以上が必要です。
    - 「送る画像を確認」で、実際に送る A_marked（学習時と同じ形の丸）を表示
 4. 右：枠ごとに入れる B、服装、設定（Turbo / 通常・LoRA の強さ 0〜1.5・シード・枚数 1〜4）を選ぶ。指示文（英語）は自動で作られ、
    開いて編集もできる（編集すると自動生成は止まる。「自動生成に戻す」で戻る）
-5. 「生成する」。結果は中央に表示（比較スライダー・複数枚の切り替え・シードを変えて再生成・強さを変える・保存）
+5. 「生成する」。結果は中央に表示（比較スライダー・複数枚の切り替え・シードを変えて再生成・強さを変える・保存）。
+   中央下の「今回の結果」から、このセッションで作った結果を開き直せます（リロードすると消えます）
 
 **スマホ**（「枠の指定」→「結果」の 2 画面）
 
 - 画像の上で人物をタップすると枠が付き、もう一度タップで外れます。角をドラッグで大きさを調整
 - 下のシートで、枠 → B（タップで B の選択・追加・切り抜き）、服装（変更）、設定（1 行の要約 → 変更）、生成
 - 結果画面で左右ドラッグの比較、シード変更で再生成、強さ変更、保存
-- 右上のメニューから実行先の切り替え・履歴・設定
+- 右上のメニューから実行先の切り替え・設定・直近の結果
 
 ---
 
@@ -174,6 +177,26 @@ A_marked は `backend/app/markers.py` が Pillow で描きます（学習時の 
 線幅 max(4, 短辺の 0.8%)、番号バッジ = 半径 max(18, 短辺の 3.2%)・白縁・白い太字、顔を避ける位置。楕円が隣の人や他人の顔に
 かかるときは角丸矩形など）。
 
+## 履歴を残さない（データの扱い）
+
+このアプリは生成の履歴を残しません。
+
+- 生成ジョブはサーバーのメモリ上のキューで処理し、送った画像（A_marked・B）と結果は一時フォルダ（`data/tmp/jobs/<id>/`）にだけ置きます。
+  ブラウザが結果を受け取る（メモリ上の blob に取り込む）と、すぐにサーバー側の一時ファイルを消します。受け取られなかった場合も、
+  ジョブが終わってから 10 分で消します
+- アップロードした A・B（`data/tmp/images/`）は編集中のセッションのための一時ファイルで、最後に使ってから 6 時間で消します
+- アプリの起動時に一時フォルダを空にします（旧版が作った `data/jobs`・`data/images`・`swap.db` も消します）
+- 画面には今回のセッションの結果だけが出ます。リロードすると消えるので、残したい画像は「保存する」でダウンロードしてください
+- 残すのは設定（`data/settings.json`）、セットアップの状況（`data/downloads.json`）、検出モデル（`data/detector/`）だけです
+
+**ComfyUI 側に残るもの**
+
+- ComfyUI の履歴（`/history`）の記録は、結果を受け取ったあとで API で消します（ローカルのみ）
+- ComfyUI には**ファイルを消す API が無い**ため、生成画像（ComfyUI の `output/swap_studio/`）とアップロードした画像
+  （`input/swap_studio/`）は、そのままでは ComfyUI 側に残ります。`.env` に `COMFY_OUTPUT_DIR` / `COMFY_INPUT_DIR`
+  （ComfyUI の output / input フォルダの絶対パス）を書くと、結果を受け取ったあとでそれらを消します（Docker では同じ絶対パスでマウントされます）
+- Comfy Cloud では消せません（Cloud 側の保存の扱いは Comfy Cloud の規約に従います）
+
 ## 人物・顔の自動検出
 
 ローカル CPU（onnxruntime）で動く、イラスト向けの YOLOv8 nano モデルを使います（初回に「人物を自動検出」を押したとき
@@ -208,7 +231,8 @@ Hugging Face から `data/detector/` に取得。リビジョン固定・SHA-256
 | `COMFY_CLOUD_API_KEY` | なし | Comfy Cloud の API キー（画面からも設定可） |
 | `HF_TOKEN` | なし | Hugging Face のトークン（任意） |
 | `LORA_HF_REPO` / `LORA_SHA256` | Kohei-Yamashita/swap-illustration-lora / 0e51ca1e… | LoRA の取得元と検証用ハッシュ |
-| `SWAP_DATA_DIR` | `./data` | データの置き場 |
+| `COMFY_OUTPUT_DIR` / `COMFY_INPUT_DIR` | なし | ComfyUI の output / input フォルダ（設定すると、ComfyUI 側に残る画像を消す） |
+| `SWAP_DATA_DIR` | `./data` | 設定・検出モデル・一時ファイルの置き場 |
 
 画面の設定（実行先・LoRA のファイル名・API キーなど）は `data/settings.json`（git 管理外）に保存されます。
 
@@ -225,9 +249,8 @@ backend/
     workflow.py      ComfyUI のワークフロー組み立て（LoRA の挿入）
     workflows/       ワークフロー JSON（Karakuri Media Studio の写し）
     comfy.py         ローカル ComfyUI / Comfy Cloud のクライアント
-    jobs.py          ジョブキュー（同時 1・中断の自動リトライ）
-    db.py            履歴（SQLite）
-    images.py        アップロード画像・切り抜き
+    jobs.py          ジョブキュー（メモリ上・同時 1・中断の自動リトライ・一時ファイルの後始末）
+    images.py        アップロード画像（一時）・切り抜き
     detector.py      人物・顔の自動検出（onnxruntime）
     model_setup.py   セットアップ（必要ファイルの確認・再開できるダウンロード）
   tests/             pytest

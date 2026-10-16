@@ -66,13 +66,6 @@ class GenerateRequest(SceneSpec):
     settings: GenSettings = Field(default_factory=GenSettings)
 
 
-class RerunRequest(BaseModel):
-    seed: int | None = Field(default=None, ge=0, le=2**53)
-    strength: float | None = Field(default=None, ge=0.0, le=1.5)
-    count: int | None = Field(default=None, ge=1, le=4)
-    model: Literal["turbo", "base"] | None = None
-
-
 class CropRequest(BaseModel):
     box: Box
 

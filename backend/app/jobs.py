@@ -1,9 +1,14 @@
-"""生成ジョブ（サーバー側のキュー、同時 1 件）。
+"""生成ジョブ（メモリ上のキュー、同時 1 件）。履歴は残さない。
 
 1 ジョブ = 「生成」ボタン 1 回。枚数ぶん（シードを +1 ずつ）ComfyUI に 1 枚ずつ投げる。
 
 - A_marked（または A）と B 群を ComfyUI にアップロード → ワークフローを組んで /prompt → 完了まで
-  /history（Comfy Cloud は /api/jobs）をポーリング → 結果を data/jobs/<id>/ に保存。
+  /history（Comfy Cloud は /api/jobs）をポーリング → 結果を一時フォルダ（data/tmp/jobs/<id>/）に受け取る。
+- **履歴を残さない**: ジョブはメモリにだけ持つ。ブラウザが結果を受け取ったら ``DELETE /api/jobs/{id}``
+  で一時ファイルごと消す。受け取られなくても、終わってから ``JOB_TTL`` 秒で消す。アプリの起動時には
+  一時フォルダを空にする。ComfyUI 側に残る生成画像・アップロードした画像は、``COMFY_OUTPUT_DIR`` /
+  ``COMFY_INPUT_DIR`` が設定されていれば消す（ComfyUI に削除 API が無いため）。履歴（/history）の
+  記録は API で消す。
 - 進捗は ComfyUI の WebSocket の progress を拾う（取れなくても生成はできる）。
 - **中断の自動リトライ**: 同じ ComfyUI を Karakuri Media Studio と共有していると、Karakuri がジョブを
   取り消すときに呼ぶ /interrupt でこちらの実行中のジョブが止まることがある。execution_interrupted を
@@ -24,13 +29,13 @@ from typing import Any
 
 from PIL import Image
 
-from . import db, images
+from . import images
 from .comfy import (ComfyClient, ComfyError, ComfyExecutionError, ComfyInterrupted, classify_history,
                     error_message, output_images)
-from .config import data_dir, load_settings
+from .config import comfy_input_dir, comfy_output_dir, load_settings, tmp_dir
 from .instructions import TargetSpec, build_instruction, is_face_closeup
 from .markers import Person, assign_faces, draw_marks
-from .models import GenerateRequest, RerunRequest, SceneSpec
+from .models import GenerateRequest, SceneSpec
 from .workflow import build_edit
 
 log = logging.getLogger(__name__)
@@ -45,6 +50,12 @@ POLL_CLOUD = 3.0
 MAX_POLL_FAILURES = 30
 #: 1 枚あたりの待ち時間の上限（ほかのジョブの後ろで待つこともあるので長め）
 IMAGE_TIMEOUT = 3 * 3600
+#: 終わったジョブを（ブラウザが受け取らなくても）消すまでの秒数
+JOB_TTL = 10 * 60
+#: 期限切れの掃除の間隔
+SWEEP_INTERVAL = 60.0
+
+FINISHED = ("done", "error", "cancelled")
 
 
 class JobCancelled(Exception):
@@ -52,9 +63,25 @@ class JobCancelled(Exception):
 
 
 def jobs_dir() -> Path:
-    d = data_dir() / "jobs"
+    d = tmp_dir() / "jobs"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _remove_inside(base: Path | None, rel: str) -> bool:
+    """base の中の rel を消す（base の外は触らない）。消せたら True。"""
+    if base is None or not rel:
+        return False
+    try:
+        root = base.expanduser().resolve()
+        p = (root / rel).resolve()
+        if root not in p.parents or not p.is_file():
+            return False
+        p.unlink()
+        return True
+    except OSError as exc:
+        log.info("could not remove %s: %s", rel, exc)
+        return False
 
 
 # --------------------------------------------------------------------------- 指示文と A_marked
@@ -102,17 +129,15 @@ def render_marked(spec: SceneSpec) -> tuple[Image.Image, list[dict]]:
 
 
 # --------------------------------------------------------------------------- 表示用
-def job_out(job: dict[str, Any] | None, live: dict | None = None) -> dict[str, Any] | None:
+def job_out(job: dict[str, Any] | None) -> dict[str, Any] | None:
     if job is None:
         return None
     jid = job["id"]
     base = f"/api/jobs/{jid}/files/"
-    out = {k: job[k] for k in ("id", "created_at", "finished_at", "status", "message", "error", "progress",
-                               "prompt", "request", "settings", "parent_id")}
+    out = {k: job.get(k) for k in ("id", "created_at", "finished_at", "status", "message", "error", "progress",
+                                   "prompt", "request", "settings")}
     out["inputs"] = {k: base + v for k, v in job["inputs"].items()}
     out["results"] = [{**r, "url": base + r["file"]} for r in job["results"]]
-    if live:
-        out.update(live)
     return out
 
 
@@ -135,25 +160,29 @@ def friendly_error(exc: Exception, client: ComfyClient | None, lora: str | None)
 class JobManager:
     def __init__(self) -> None:
         self.queue: asyncio.Queue[str] = asyncio.Queue()
-        self.live: dict[str, dict] = {}         # 実行中ジョブの進捗（DB への書き込みを間引く）
+        self.jobs: dict[str, dict[str, Any]] = {}     # メモリにだけ持つ（再起動で消える）
         self.cancel_flags: set[str] = set()
         self.current_pid: dict[str, tuple[ComfyClient, str]] = {}
         self._worker: asyncio.Task | None = None
+        self._sweeper: asyncio.Task | None = None
 
     def start(self) -> None:
         if self._worker is None or self._worker.done():
-            # キューはイベントループに結びつくので、起動のたびに作り直す（待ち中のジョブは起動時に中断扱い）
+            # キューはイベントループに結びつくので、起動のたびに作り直す
             self.queue = asyncio.Queue()
             self._worker = asyncio.create_task(self._loop())
+        if self._sweeper is None or self._sweeper.done():
+            self._sweeper = asyncio.create_task(self._sweep_loop())
 
     async def stop(self) -> None:
-        if self._worker:
-            self._worker.cancel()
-            try:
-                await self._worker
-            except asyncio.CancelledError:
-                pass
-            self._worker = None
+        for t in (self._worker, self._sweeper):
+            if t:
+                t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+        self._worker = self._sweeper = None
 
     # ---------------------------------------------------------------- 投入
     def submit(self, req: GenerateRequest) -> dict[str, Any]:
@@ -169,13 +198,12 @@ class JobManager:
         d = jobs_dir() / jid
         d.mkdir(parents=True)
         inputs: dict[str, str] = {}
-        scene.save(d / "A.png")
-        inputs["A"] = "A.png"
         if req.mode == "marked":
             marked, _shapes = draw_marks(scene, scene_persons(req, *scene.size))
             marked.save(d / "A_marked.png")
             inputs["canvas"] = "A_marked.png"
         else:
+            scene.save(d / "A.png")
             inputs["canvas"] = "A.png"
         for i, t in enumerate(req.targets, start=1):
             shutil.copyfile(images.image_path(req.refs[t.ref]), d / f"B{i}.png")
@@ -193,42 +221,19 @@ class JobManager:
             "face": info["face"],
             "prompt_edited": bool((req.prompt_override or "").strip()),
         }
-        job = {"id": jid, "created_at": time.time(), "status": "queued", "prompt": prompt,
-               "request": req.model_dump(), "settings": resolved, "inputs": inputs}
-        db.insert_job(job)
+        job = {"id": jid, "created_at": time.time(), "finished_at": None, "status": "queued", "message": None,
+               "error": None, "progress": 0.0, "prompt": prompt, "request": req.model_dump(),
+               "settings": resolved, "inputs": inputs, "results": []}
+        self.jobs[jid] = job
         self.queue.put_nowait(jid)
-        return job_out(db.get_job(jid))  # type: ignore[return-value]
-
-    def rerun(self, job_id: str, rr: RerunRequest) -> dict[str, Any]:
-        """同じ入力・指示文で、シードや強さを変えて生成し直す。"""
-        src = db.get_job(job_id)
-        if src is None:
-            raise KeyError(job_id)
-        jid = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
-        d = jobs_dir() / jid
-        d.mkdir(parents=True)
-        for name in set(src["inputs"].values()):
-            shutil.copyfile(jobs_dir() / job_id / name, d / name)
-        st = dict(src["settings"])
-        st["seed"] = rr.seed if rr.seed is not None else random.randint(0, 2**31 - 1)
-        if rr.strength is not None:
-            st["strength"] = round(rr.strength, 3)
-        if rr.count is not None:
-            st["count"] = rr.count
-        if rr.model is not None:
-            st["model"] = rr.model
-        job = {"id": jid, "created_at": time.time(), "status": "queued", "prompt": src["prompt"],
-               "request": src["request"], "settings": st, "inputs": src["inputs"], "parent_id": job_id}
-        db.insert_job(job)
-        self.queue.put_nowait(jid)
-        return job_out(db.get_job(jid))  # type: ignore[return-value]
+        return job_out(job)  # type: ignore[return-value]
 
     async def cancel(self, job_id: str) -> None:
-        job = db.get_job(job_id)
+        job = self.jobs.get(job_id)
         if job is None:
             raise KeyError(job_id)
         if job["status"] == "queued":
-            db.update_job(job_id, status="cancelled", finished_at=time.time(), message="取り消しました")
+            job.update(status="cancelled", finished_at=time.time(), message="取り消しました")
             return
         if job["status"] == "running":
             self.cancel_flags.add(job_id)
@@ -241,17 +246,56 @@ class JobManager:
                     log.info("cancel failed: %s", exc)
 
     def get(self, job_id: str) -> dict[str, Any] | None:
-        return job_out(db.get_job(job_id), self.live.get(job_id))
+        return job_out(self.jobs.get(job_id))
 
-    def pending_ahead(self, job_id: str) -> int:
-        return list(self.queue._queue).index(job_id) if job_id in self.queue._queue else 0  # type: ignore[attr-defined]
+    def file_path(self, job_id: str, name: str) -> Path | None:
+        job = self.jobs.get(job_id)
+        if job is None:
+            return None
+        allowed = set(job["inputs"].values()) | {r["file"] for r in job["results"]}
+        if name not in allowed:
+            return None
+        p = jobs_dir() / job_id / name
+        return p if p.is_file() else None
+
+    def discard(self, job_id: str) -> bool:
+        """終わったジョブを一時ファイルごと消す（ブラウザが結果を受け取ったあと / 期限切れ）。"""
+        job = self.jobs.get(job_id)
+        if job is None:
+            return False
+        if job["status"] not in FINISHED:
+            raise RuntimeError("生成中のジョブは消せません（先に取り消してください）")
+        self.jobs.pop(job_id, None)
+        shutil.rmtree(jobs_dir() / job_id, ignore_errors=True)
+        return True
+
+    def sweep(self, now: float | None = None) -> list[str]:
+        """終わってから JOB_TTL 秒たったジョブと、どのジョブにも属さない一時フォルダを消す。"""
+        now = now or time.time()
+        gone = [jid for jid, j in self.jobs.items()
+                if j["status"] in FINISHED and j.get("finished_at") and now - j["finished_at"] > JOB_TTL]
+        for jid in gone:
+            self.discard(jid)
+        for d in jobs_dir().iterdir():
+            if d.is_dir() and d.name not in self.jobs:
+                shutil.rmtree(d, ignore_errors=True)
+        images.sweep()
+        return gone
+
+    async def _sweep_loop(self) -> None:
+        while True:
+            await asyncio.sleep(SWEEP_INTERVAL)
+            try:
+                self.sweep()
+            except Exception:  # noqa: BLE001 - 掃除の失敗で止めない
+                log.exception("sweep failed")
 
     # ---------------------------------------------------------------- 実行
     async def _loop(self) -> None:
         while True:
             jid = await self.queue.get()
             try:
-                job = db.get_job(jid)
+                job = self.jobs.get(jid)
                 if job is None or job["status"] != "queued":
                     continue
                 await self.run_job(job)
@@ -260,17 +304,13 @@ class JobManager:
             finally:
                 self.queue.task_done()
 
-    def _set_live(self, jid: str, **kw: Any) -> None:
-        self.live.setdefault(jid, {}).update(kw)
-
     async def run_job(self, job: dict[str, Any], client: ComfyClient | None = None) -> None:
         jid = job["id"]
         st = job["settings"]
         d = jobs_dir() / jid
-        db.update_job(jid, status="running", message="準備中")
-        self._set_live(jid, status="running", message="準備中", progress=0.0)
-        results: list[dict] = []
+        job.update(status="running", message="準備中", progress=0.0)
         watcher: asyncio.Task | None = None
+        uploaded: list[str] = []
         try:
             if client is None:
                 client = ComfyClient.from_settings(load_settings(), st["target"])
@@ -279,52 +319,66 @@ class JobManager:
 
             def on_progress(pid: str | None, frac: float) -> None:
                 if pid and pid == state["pid"]:
-                    self._set_live(jid, progress=round((state["index"] + frac) / st["count"], 3))
+                    job["progress"] = round((state["index"] + frac) / st["count"], 3)
 
             watcher = asyncio.create_task(client.watch_progress(client_id, on_progress))
-            self._set_live(jid, message="画像をアップロード中")
-            names = []
+            job["message"] = "画像をアップロード中"
             order = ["canvas"] + [f"B{i}" for i in range(1, len(job["inputs"]))]
             for key in order:
                 if key in job["inputs"]:
-                    src = d / job["inputs"][key]
-                    up = d / f".upload_{jid}_{key}.png"
-                    shutil.copyfile(src, up)
+                    up = d / f"swap_{jid}_{key}.png"
+                    shutil.copyfile(d / job["inputs"][key], up)
                     try:
-                        names.append(await client.upload_image(up))
+                        uploaded.append(await client.upload_image(up))
                     finally:
                         up.unlink(missing_ok=True)
             for i in range(st["count"]):
                 state["index"] = i
                 seed = int(st["seed"]) + i
-                graph = build_edit(job["prompt"], names, seed, st["model"], st["lora_name"], st["strength"])
+                graph = build_edit(job["prompt"], uploaded, seed, st["model"], st["lora_name"], st["strength"])
                 t0 = time.time()
-                entry = await self._run_one(jid, client, graph, client_id, state, i, st["count"])
+                entry, pid = await self._run_one(jid, client, graph, client_id, state, i, st["count"])
                 imgs = output_images(entry)
                 if not imgs:
                     raise ComfyError("ComfyUI から結果の画像が返ってきませんでした")
                 name = f"out_{i + 1}_seed{seed}.png"
                 await client.download(imgs[0], d / name)
-                results.append({"file": name, "seed": seed, "elapsed": round(time.time() - t0, 1)})
-                db.update_job(jid, results=results, progress=(i + 1) / st["count"])
-                self._set_live(jid, progress=(i + 1) / st["count"])
-            db.update_job(jid, status="done", finished_at=time.time(), message=None, progress=1.0)
+                await self._cleanup_comfy_output(client, pid, imgs)
+                job["results"].append({"file": name, "seed": seed, "elapsed": round(time.time() - t0, 1)})
+                job["progress"] = (i + 1) / st["count"]
+            job.update(status="done", message=None, progress=1.0)
         except JobCancelled:
-            db.update_job(jid, status="cancelled", finished_at=time.time(), message="取り消しました", results=results)
+            job.update(status="cancelled", message="取り消しました")
         except Exception as exc:  # noqa: BLE001
             log.warning("job %s failed: %s", jid, exc)
-            db.update_job(jid, status="error", finished_at=time.time(), results=results,
-                          error=friendly_error(exc, client, st.get("lora_name")), message=None)
+            job.update(status="error", message=None, error=friendly_error(exc, client, st.get("lora_name")))
         finally:
+            job["finished_at"] = time.time()
             if watcher:
                 watcher.cancel()
-            self.live.pop(jid, None)
+            if client is not None and not client.cloud:
+                for name in uploaded:
+                    _remove_inside(comfy_input_dir(), name)
             self.cancel_flags.discard(jid)
             self.current_pid.pop(jid, None)
 
+    async def _cleanup_comfy_output(self, client: ComfyClient, pid: str, imgs: list[dict]) -> None:
+        """ComfyUI 側に残った結果を消す（ローカルのみ。ファイルは output フォルダの設定があるときだけ）。"""
+        if client.cloud:
+            return
+        for im in imgs:
+            if im.get("type", "output") == "output":
+                sub = im.get("subfolder") or ""
+                _remove_inside(comfy_output_dir(), f"{sub}/{im['filename']}" if sub else im["filename"])
+        try:
+            await client.delete_history(pid)
+        except ComfyError as exc:
+            log.info("could not delete ComfyUI history %s: %s", pid, exc)
+
     async def _run_one(self, jid: str, client: ComfyClient, graph: dict, client_id: str, state: dict,
-                       index: int, count: int) -> dict:
+                       index: int, count: int) -> tuple[dict, str]:
         """1 枚ぶん。中断されたら（自分で取り消したのでなければ）間隔を空けて投げ直す。"""
+        job = self.jobs[jid]
         attempt = 0
         label = f"{index + 1}/{count} 枚目"
         while True:
@@ -333,9 +387,9 @@ class JobManager:
             pid = await client.queue_prompt(graph, client_id)
             state["pid"] = pid
             self.current_pid[jid] = (client, pid)
-            self._set_live(jid, message=f"{label}を生成中" + (f"（投げ直し {attempt}/{MAX_RETRIES}）" if attempt else ""))
+            job["message"] = f"{label}を生成中" + (f"（投げ直し {attempt}/{MAX_RETRIES}）" if attempt else "")
             try:
-                return await self._wait(jid, client, pid, label)
+                return await self._wait(jid, client, pid, label), pid
             except ComfyInterrupted:
                 if jid in self.cancel_flags:
                     raise JobCancelled()
@@ -346,8 +400,7 @@ class JobManager:
                 msg = (f"{label}が中断されました（同じ ComfyUI を使う別のアプリの取り消しに巻き込まれた可能性）。"
                        f"{int(RETRY_WAIT)} 秒後に投げ直します（{attempt}/{MAX_RETRIES}）")
                 log.info("job %s: %s", jid, msg)
-                self._set_live(jid, message=msg)
-                db.update_job(jid, message=msg)
+                job["message"] = msg
                 await self._sleep_unless_cancelled(jid, RETRY_WAIT)
 
     async def _sleep_unless_cancelled(self, jid: str, seconds: float) -> None:
@@ -358,6 +411,7 @@ class JobManager:
             await asyncio.sleep(min(0.5, max(0.0, end - time.monotonic())))
 
     async def _wait(self, jid: str, client: ComfyClient, pid: str, label: str) -> dict:
+        job = self.jobs[jid]
         interval = POLL_CLOUD if client.cloud else POLL_LOCAL
         failures = 0
         t0 = time.monotonic()
@@ -386,14 +440,27 @@ class JobManager:
                     q = await client.queue_state()
                     if pid in q["pending"]:
                         ahead = q["pending"].index(pid) + len(q["running"])
-                        self._set_live(jid, message=f"{label}: ComfyUI の順番待ち（前に {ahead} 件）")
+                        job["message"] = f"{label}: ComfyUI の順番待ち（前に {ahead} 件）"
                     elif pid in q["running"]:
-                        self._set_live(jid, message=f"{label}を生成中")
+                        job["message"] = f"{label}を生成中"
                 except ComfyError:
                     pass
             if time.monotonic() - t0 > IMAGE_TIMEOUT:
                 raise ComfyError("時間内に生成が終わりませんでした")
             await asyncio.sleep(interval)
+
+
+def startup_cleanup() -> None:
+    """起動時: 一時フォルダを空にし、旧版が残した履歴（data/jobs・data/images・swap.db）を消す。"""
+    from .config import data_dir
+
+    shutil.rmtree(tmp_dir(), ignore_errors=True)
+    tmp_dir()
+    base = data_dir()
+    for name in ("jobs", "images"):
+        shutil.rmtree(base / name, ignore_errors=True)
+    for name in ("swap.db", "swap.db-wal", "swap.db-shm"):
+        (base / name).unlink(missing_ok=True)
 
 
 manager = JobManager()

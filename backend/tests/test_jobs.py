@@ -1,14 +1,15 @@
-"""ジョブの実行（ComfyUI は偽物）: 中断の自動リトライ、エラー、取り消し、再生成。"""
+"""ジョブの実行（ComfyUI は偽物）: 中断の自動リトライ、エラー、取り消し、一時ファイルの後始末。"""
 
 from __future__ import annotations
 
 import io
+import time
 
 import pytest
 from PIL import Image
 
-from app import db, images, jobs
-from app.models import GenerateRequest, RerunRequest
+from app import images, jobs
+from app.models import GenerateRequest
 
 
 def _png(size=(400, 300), color=(200, 220, 240)) -> bytes:
@@ -28,6 +29,7 @@ class FakeClient:
         self.queued = []
         self.uploaded = []
         self.cancelled = []
+        self.history_deleted = []
 
     async def upload_image(self, path, subfolder="swap_studio"):
         self.uploaded.append(path.name)
@@ -52,6 +54,9 @@ class FakeClient:
 
     async def cancel(self, pid):
         self.cancelled.append(pid)
+
+    async def delete_history(self, pid):
+        self.history_deleted.append(pid)
 
     async def download(self, image, dest):
         dest.write_bytes(_png((40, 30)))
@@ -83,7 +88,9 @@ async def test_submit_writes_inputs_and_prompt(req):
     assert job["status"] == "queued"
     assert job["prompt"].startswith("Replace the person circled in red (marker 1) in <image1>")
     d = jobs.jobs_dir() / job["id"]
-    assert {p.name for p in d.iterdir()} == {"A.png", "A_marked.png", "B1.png", "B2.png"}
+    assert {p.name for p in d.iterdir()} == {"A_marked.png", "B1.png", "B2.png"}
+    # 一時フォルダ（data/tmp）の中だけに置く
+    assert "tmp" in d.parts
     assert job["settings"]["seed"] == 11 and job["settings"]["lora_name"] == "qwen-image-21/anime-swap.safetensors"
     # A_marked には赤い線が入っている
     marked = Image.open(d / "A_marked.png").convert("RGB")
@@ -94,8 +101,8 @@ async def test_interrupted_is_retried(req):
     m = jobs.JobManager()
     job = m.submit(req)
     fake = FakeClient(["interrupted", "interrupted", "success", "success"])
-    await m.run_job(db.get_job(job["id"]), client=fake)
-    done = db.get_job(job["id"])
+    await m.run_job(m.jobs[job["id"]], client=fake)
+    done = m.jobs[job["id"]]
     assert done["status"] == "done", done["error"]
     assert [r["seed"] for r in done["results"]] == [11, 12]
     assert len(fake.queued) == 4
@@ -113,8 +120,8 @@ async def test_gives_up_after_max_retries(req, monkeypatch):
     monkeypatch.setattr(jobs, "MAX_RETRIES", 2)
     m = jobs.JobManager()
     job = m.submit(req)
-    await m.run_job(db.get_job(job["id"]), client=FakeClient(["interrupted"] * 10))
-    done = db.get_job(job["id"])
+    await m.run_job(m.jobs[job["id"]], client=FakeClient(["interrupted"] * 10))
+    done = m.jobs[job["id"]]
     assert done["status"] == "error"
     assert "中断" in done["error"]
 
@@ -122,8 +129,8 @@ async def test_gives_up_after_max_retries(req, monkeypatch):
 async def test_execution_error_is_reported(req):
     m = jobs.JobManager()
     job = m.submit(req)
-    await m.run_job(db.get_job(job["id"]), client=FakeClient(["error"]))
-    done = db.get_job(job["id"])
+    await m.run_job(m.jobs[job["id"]], client=FakeClient(["error"]))
+    done = m.jobs[job["id"]]
     assert done["status"] == "error" and "CUDA OOM" in done["error"]
 
 
@@ -132,17 +139,66 @@ async def test_own_cancel_is_not_retried(req):
     job = m.submit(req)
     fake = FakeClient(["interrupted", "success", "success"])
     m.cancel_flags.add(job["id"])   # こちらが取り消した
-    await m.run_job(db.get_job(job["id"]), client=fake)
-    assert db.get_job(job["id"])["status"] == "cancelled"
+    await m.run_job(m.jobs[job["id"]], client=fake)
+    assert m.jobs[job["id"]]["status"] == "cancelled"
 
 
-async def test_rerun_copies_inputs(req):
+async def test_discard_and_ttl_remove_temp_files(req, monkeypatch):
     m = jobs.JobManager()
     job = m.submit(req)
-    re = m.rerun(job["id"], RerunRequest(seed=99, strength=0.8, count=1))
-    assert re["parent_id"] == job["id"] and re["prompt"] == job["prompt"]
-    assert re["settings"]["seed"] == 99 and re["settings"]["strength"] == 0.8 and re["settings"]["count"] == 1
-    assert (jobs.jobs_dir() / re["id"] / "A_marked.png").is_file()
+    with pytest.raises(RuntimeError):
+        m.discard(job["id"])            # 生成中・待ち中は消せない
+    await m.run_job(m.jobs[job["id"]], client=FakeClient(["success", "success"]))
+    d = jobs.jobs_dir() / job["id"]
+    assert d.is_dir() and m.file_path(job["id"], m.jobs[job["id"]]["results"][0]["file"])
+    assert m.discard(job["id"])          # ブラウザが受け取った
+    assert not d.exists() and m.get(job["id"]) is None
+
+    job2 = m.submit(req)
+    await m.run_job(m.jobs[job2["id"]], client=FakeClient(["success", "success"]))
+    assert m.sweep() == []               # まだ期限内
+    assert m.sweep(now=time.time() + jobs.JOB_TTL + 1) == [job2["id"]]
+    assert not (jobs.jobs_dir() / job2["id"]).exists()
+
+
+async def test_comfy_output_and_input_removed(req, tmp_path, monkeypatch):
+    out_dir = tmp_path / "comfy_out"
+    in_dir = tmp_path / "comfy_in" / "swap_studio"
+    out_dir.mkdir()
+    in_dir.mkdir(parents=True)
+    monkeypatch.setenv("COMFY_OUTPUT_DIR", str(out_dir))
+    monkeypatch.setenv("COMFY_INPUT_DIR", str(tmp_path / "comfy_in"))
+
+    class Fake(FakeClient):
+        async def upload_image(self, path, subfolder="swap_studio"):
+            (in_dir / path.name).write_bytes(b"x")
+            return await super().upload_image(path, subfolder)
+
+        async def history(self, pid):
+            (out_dir / f"{pid}.png").write_bytes(b"png")
+            return await super().history(pid)
+
+    m = jobs.JobManager()
+    job = m.submit(req)
+    fake = Fake(["success", "success"])
+    await m.run_job(m.jobs[job["id"]], client=fake)
+    assert m.jobs[job["id"]]["status"] == "done"
+    assert list(out_dir.iterdir()) == []          # ComfyUI の output に残った結果を消した
+    assert list(in_dir.iterdir()) == []           # アップロードした画像も消した
+    assert fake.history_deleted == ["p1", "p2"]   # ComfyUI の履歴の記録も消した
+
+
+def test_startup_cleanup_removes_legacy_history(tmp_data):
+    (tmp_data / "jobs" / "old").mkdir(parents=True)
+    (tmp_data / "images").mkdir()
+    (tmp_data / "swap.db").write_bytes(b"")
+    (tmp_data / "tmp" / "jobs" / "x").mkdir(parents=True)
+    (tmp_data / "settings.json").write_text("{}")
+    jobs.startup_cleanup()
+    assert not (tmp_data / "jobs").exists() and not (tmp_data / "images").exists()
+    assert not (tmp_data / "swap.db").exists()
+    assert list((tmp_data / "tmp").iterdir()) == []
+    assert (tmp_data / "settings.json").exists()   # 設定は残す
 
 
 async def test_position_mode_sends_plain_a(req):
@@ -150,6 +206,7 @@ async def test_position_mode_sends_plain_a(req):
     m = jobs.JobManager()
     job = m.submit(req)
     assert job["inputs"]["canvas"].endswith("/A.png")
+    assert "A_marked" not in str(job["inputs"])
     assert job["prompt"].startswith("In <image1>, replace the person on the left with the person from <image2>")
 
 

@@ -47,7 +47,7 @@ export default function CompareSlider(props: { result: string; original: string;
           onKeyDown={onKey}
         >
           <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-            <path d="M6 4L2 8l4 4M10 4l4 4-4 4" fill="none" stroke="#16181C" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+            <path d="M6 4L2 8l4 4M10 4l4 4-4 4" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
         </span>
       </div>

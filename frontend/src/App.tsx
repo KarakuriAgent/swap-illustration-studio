@@ -1,10 +1,10 @@
 // Swap Illustration Studio の画面（PC は 3 カラム、スマホは「枠の指定」→「結果」の 2 画面）
 
-import { useCallback, useEffect, useMemo, useReducer, useState } from 'react'
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import { ApiError, api, setUnauthorizedHandler } from './api'
 import CropDialog from './components/CropDialog'
 import { Dialog, FileButton, Segmented, Spinner, readClipboardImage } from './components/common'
-import { HistoryDialog, HistoryStrip } from './components/HistoryPanel'
+import SessionStrip from './components/SessionStrip'
 import Login from './components/Login'
 import { Logo } from './components/Logo'
 import {
@@ -28,13 +28,13 @@ import type {
   Box,
   Detection,
   FaceMode,
-  Frame,
   GenSettings,
   Health,
+  GenerateRequest,
   ImageInfo,
-  Job,
   Mode,
   RefImage,
+  SessionJob,
   Target,
 } from './types'
 
@@ -107,10 +107,10 @@ function Studio({ onLogout }: { onLogout: () => void }) {
   const [crop, setCrop] = useState<{ image: ImageInfo; replaceIndex: number | null } | null>(null)
   const [busy, setBusy] = useState(false)
   const [toast, setToast] = useState<{ kind: 'error' | 'info'; text: string } | null>(null)
-  const [jobs, setJobs] = useState<Job[]>([])
-  const [currentJob, setCurrentJob] = useState<Job | null>(null)
+  const [session, setSession] = useState<SessionJob[]>([])
+  const [currentId, setCurrentId] = useState<string | null>(null)
   const [view, setView] = useState<'edit' | 'result'>('edit')
-  const [dialog, setDialog] = useState<null | 'settings' | 'history' | 'outfit' | 'gen' | 'menu' | { pickFor: number }>(null)
+  const [dialog, setDialog] = useState<null | 'settings' | 'outfit' | 'gen' | 'menu' | { pickFor: number }>(null)
 
   const setGen = (g: GenSettings) => {
     setGenState(g)
@@ -133,17 +133,10 @@ function Studio({ onLogout }: { onLogout: () => void }) {
   const refreshHealth = useCallback(() => {
     api.health().then(setHealth).catch(() => setHealth(null))
   }, [])
-  const refreshJobs = useCallback(() => {
-    api
-      .jobs(60)
-      .then((r) => setJobs(r.jobs))
-      .catch(() => null)
-  }, [])
   useEffect(() => {
     api.settings().then(setSettings).catch(showError)
     refreshHealth()
-    refreshJobs()
-  }, [refreshHealth, refreshJobs])
+  }, [refreshHealth])
 
   // ---------------------------------------------------------------- 画像の追加
   const uploadScene = async (file: Blob) => {
@@ -289,16 +282,25 @@ function Studio({ onLogout }: { onLogout: () => void }) {
     }
   }
 
-  // ---------------------------------------------------------------- 生成・結果
+  // ---------------------------------------------------------------- 生成・結果（今回のセッションだけ）
   const reason = validate(input)
-  const generate = async () => {
-    if (reason) return showError(reason)
+
+  const updateEntry = useCallback((id: string, fn: (e: SessionJob) => SessionJob) => {
+    setSession((list) => list.map((e) => (e.job.id === id ? fn(e) : e)))
+  }, [])
+
+  /** 生成を投入して、今回の結果の一覧に足す（元の A はブラウザのメモリに取り込んでおく） */
+  const submit = async (req: GenerateRequest, original: { url: string | null; size: SessionJob['size'] }) => {
     setBusy(true)
     try {
-      const job = await api.generate(generateRequest(input, gen, promptOverride))
-      setCurrentJob(job)
+      const job = await api.generate(req)
+      const originalBlob = original.url ? await api.fetchBlobUrl(original.url).catch(() => null) : null
+      setSession((list) => [
+        { job, results: [], inputs: {}, original: originalBlob, size: original.size, received: false, receiveError: null },
+        ...list,
+      ])
+      setCurrentId(job.id)
       setView('result')
-      refreshJobs()
     } catch (e) {
       showError(e)
     } finally {
@@ -306,105 +308,91 @@ function Studio({ onLogout }: { onLogout: () => void }) {
     }
   }
 
-  // 実行中のジョブを 1 秒ごとに取り直す
-  const jobId = currentJob?.id
-  const jobActive = currentJob && (currentJob.status === 'queued' || currentJob.status === 'running')
+  const generate = async () => {
+    if (reason || !scene) return showError(reason ?? '入力が足りません')
+    await submit(generateRequest(input, gen, promptOverride), {
+      url: scene.url,
+      size: { width: scene.width, height: scene.height },
+    })
+  }
+
+  // 生成中のジョブを 1 秒ごとに取り直し、終わったら結果をブラウザに受け取ってサーバー側を消す
+  const receiving = useRef(new Set<string>())
+  const activeIds = session
+    .filter((e) => e.job.status === 'queued' || e.job.status === 'running')
+    .map((e) => e.job.id)
+    .join(',')
   useEffect(() => {
-    if (!jobId || !jobActive) return
+    if (!activeIds) return
+    const ids = activeIds.split(',')
     const t = window.setInterval(() => {
-      api
-        .job(jobId)
-        .then((j) => {
-          setCurrentJob(j)
-          if (j.status !== 'queued' && j.status !== 'running') refreshJobs()
-        })
-        .catch(() => null)
+      ids.forEach((id) => {
+        api
+          .job(id)
+          .then((j) => updateEntry(id, (e) => ({ ...e, job: j })))
+          .catch((err) => {
+            if (err instanceof ApiError && err.status === 404) {
+              updateEntry(id, (e) => ({
+                ...e,
+                job: { ...e.job, status: 'error', error: 'サーバー側でジョブが見つかりません（アプリが再起動した可能性）' },
+              }))
+            }
+          })
+      })
     }, 1000)
     return () => window.clearInterval(t)
-  }, [jobId, jobActive, refreshJobs])
+  }, [activeIds, updateEntry])
+
+  useEffect(() => {
+    session.forEach((e) => {
+      const done = e.job.status === 'done' || e.job.status === 'error' || e.job.status === 'cancelled'
+      if (!done || e.received || e.receiveError || receiving.current.has(e.job.id)) return
+      receiving.current.add(e.job.id)
+      const job = e.job
+      ;(async () => {
+        try {
+          const results = await Promise.all(
+            job.results.map(async (r) => ({ url: await api.fetchBlobUrl(r.url), seed: r.seed, elapsed: r.elapsed })),
+          )
+          const inputs: Record<string, string> = {}
+          for (const [k, url] of Object.entries(job.inputs)) inputs[k] = await api.fetchBlobUrl(url)
+          await api.discardJob(job.id).catch(() => null)
+          updateEntry(job.id, (x) => ({ ...x, results, inputs, received: true }))
+        } catch (err) {
+          updateEntry(job.id, (x) => ({ ...x, receiveError: (err as Error).message }))
+        }
+      })()
+    })
+  }, [session, updateEntry])
+
+  const current = session.find((e) => e.job.id === currentId) ?? null
 
   const rerun = async (opts: { seed: number | null; strength?: number }) => {
-    if (!currentJob) return
-    setBusy(true)
-    try {
-      const job = await api.rerun(currentJob.id, { seed: opts.seed, strength: opts.strength })
-      setCurrentJob(job)
-      refreshJobs()
-    } catch (e) {
-      showError(e)
-    } finally {
-      setBusy(false)
-    }
+    if (!current) return
+    const req = current.job.request
+    await submit(
+      { ...req, settings: { ...req.settings, seed: opts.seed, strength: opts.strength ?? current.job.settings.strength } },
+      { url: null, size: current.size },
+    ).then(() => {
+      // 元の A は前の結果と同じものを使う
+      setSession((list) => list.map((e, i) => (i === 0 && !e.original ? { ...e, original: current.original } : e)))
+    })
   }
 
   const cancelJob = async () => {
-    if (!currentJob) return
+    if (!current) return
     try {
-      setCurrentJob(await api.cancel(currentJob.id))
-      refreshJobs()
+      const j = await api.cancel(current.job.id)
+      updateEntry(j.id, (e) => ({ ...e, job: j }))
     } catch (e) {
       showError(e)
     }
   }
 
-  const openJob = (job: Job) => {
-    setCurrentJob(job)
+  const openEntry = (id: string) => {
+    setCurrentId(id)
     setView('result')
     setDialog(null)
-  }
-
-  // 履歴の設定を編集画面に読み込む
-  const reuse = async (job: Job) => {
-    setBusy(true)
-    try {
-      const req = job.request
-      const getImage = async (id: string, fallbackUrl?: string): Promise<ImageInfo> => {
-        try {
-          return await api.imageInfo(id)
-        } catch (e) {
-          if (!fallbackUrl || !(e instanceof ApiError)) throw e
-          const blob = await fetch(fallbackUrl, { credentials: 'same-origin' }).then((r) => r.blob())
-          return api.uploadImage(blob)
-        }
-      }
-      const sceneImg = await getImage(req.scene_id, job.inputs.A)
-      const refImgs = await Promise.all(req.refs.map((id) => getImage(id)))
-      setScene(sceneImg)
-      setRefs(refImgs.map((image) => ({ key: newId('b'), image, original: image })))
-      const frames: Frame[] = req.targets.map((t) => ({ id: newId(), box: t.box, ref: t.ref, outfit: t.outfit, detIndex: null }))
-      dispatch({ type: 'reset', frames })
-      setDetection({
-        available: true,
-        persons: [...req.targets.map((t) => ({ box: t.box, score: 1 })), ...req.others.map((o) => ({ box: o.box, score: 1 }))],
-        faces: req.faces.map((b) => ({ box: b, score: 1 })),
-        message: '',
-      })
-      setMode(req.mode)
-      setFaceMode(req.face_mode)
-      setTemplate(req.template)
-      setGen({ model: job.settings.model, strength: job.settings.strength, seed: job.settings.seed, count: job.settings.count })
-      setPromptOverride(job.settings.prompt_edited ? job.prompt : null)
-      setView('edit')
-      setDialog(null)
-      info('履歴の設定を読み込みました')
-    } catch (e) {
-      showError(`履歴を読み込めませんでした: ${(e as Error).message}`)
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const deleteJob = async (job: Job) => {
-    try {
-      await api.deleteJob(job.id)
-      if (currentJob?.id === job.id) {
-        setCurrentJob(null)
-        setView('edit')
-      }
-      refreshJobs()
-    } catch (e) {
-      showError(e)
-    }
   }
 
   const switchTarget = async (t: Target) => {
@@ -463,14 +451,11 @@ function Studio({ onLogout }: { onLogout: () => void }) {
       {isPhone ? (
         <button type="button" className="icon-btn" aria-label="メニュー" onClick={() => setDialog('menu')}>
           <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
-            <path d="M3 5h12M3 9h12M3 13h12" stroke="#16181C" strokeWidth="1.8" strokeLinecap="round" />
+            <path d="M3 5h12M3 9h12M3 13h12" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
           </svg>
         </button>
       ) : (
         <>
-          <button type="button" className="btn" onClick={() => setDialog('history')}>
-            履歴
-          </button>
           <button type="button" className="btn" onClick={() => setDialog('settings')}>
             設定
           </button>
@@ -557,14 +542,12 @@ function Studio({ onLogout }: { onLogout: () => void }) {
     </div>
   )
 
-  const resultView = currentJob && (
+  const resultView = current && (
     <ResultView
-      job={currentJob}
-      size={scene && currentJob.request.scene_id === scene.id ? { width: scene.width, height: scene.height } : null}
+      entry={current}
       onBack={() => setView('edit')}
       onRerun={rerun}
       onCancel={cancelJob}
-      onReuse={() => reuse(currentJob)}
       busy={busy}
       maxHeight={isPhone ? '62vh' : 'calc(100vh - 380px)'}
     />
@@ -591,9 +574,6 @@ function Studio({ onLogout }: { onLogout: () => void }) {
           onClose={() => setDialog(null)}
           onLogout={onLogout}
         />
-      )}
-      {dialog === 'history' && (
-        <HistoryDialog jobs={jobs} onClose={() => setDialog(null)} onOpen={openJob} onReuse={reuse} onDelete={deleteJob} />
       )}
       {dialog === 'outfit' && (
         <Dialog title="服装" onClose={() => setDialog(null)}>
@@ -664,13 +644,10 @@ function Studio({ onLogout }: { onLogout: () => void }) {
                 </span>
               )}
             </div>
-            <button type="button" className="btn block" onClick={() => setDialog('history')}>
-              履歴
-            </button>
             <button type="button" className="btn block" onClick={() => setDialog('settings')}>
               設定・セットアップ
             </button>
-            {currentJob && (
+            {current && (
               <button
                 type="button"
                 className="btn block"
@@ -695,7 +672,7 @@ function Studio({ onLogout }: { onLogout: () => void }) {
 
   // ---------------------------------------------------------------- スマホ
   if (isPhone) {
-    if (view === 'result' && currentJob) {
+    if (view === 'result' && current) {
       return (
         <div className="app phone">
           {resultView}
@@ -775,6 +752,7 @@ function Studio({ onLogout }: { onLogout: () => void }) {
             {generateLabel}
           </button>
           {reason && scene && <p className="muted small center">{reason}</p>}
+          <SessionStrip entries={session} currentId={null} onOpen={openEntry} compact />
         </section>
         {dialogs}
       </div>
@@ -799,7 +777,7 @@ function Studio({ onLogout }: { onLogout: () => void }) {
           />
         </aside>
         <main className="col-center">
-          {view === 'result' && currentJob ? (
+          {view === 'result' && current ? (
             <section className="panel">{resultView}</section>
           ) : (
             <>
@@ -808,7 +786,7 @@ function Studio({ onLogout }: { onLogout: () => void }) {
               {preview && <p className="notice small">送る画像（A_marked）を表示中。学習時と同じ形の丸で描いています。</p>}
             </>
           )}
-          <HistoryStrip jobs={jobs} currentId={view === 'result' ? currentJob?.id ?? null : null} onOpen={openJob} onAll={() => setDialog('history')} />
+          <SessionStrip entries={session} currentId={view === 'result' ? currentId : null} onOpen={openEntry} />
         </main>
         <aside className="col-right">
           <AssignPanel frames={editor.frames} refs={refs} dispatch={dispatch} />

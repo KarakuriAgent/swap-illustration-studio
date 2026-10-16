@@ -295,6 +295,15 @@ class ComfyClient:
             # 直前に実行中が自分のジョブだと確かめているので、他のジョブを止めることはない）
             await self._request("POST", "/interrupt", json={"prompt_id": prompt_id}, timeout=5.0)
 
+    async def delete_history(self, prompt_id: str) -> None:
+        """ComfyUI の履歴（/history）から自分のジョブの記録を消す（ローカルのみ）。
+
+        出力画像のファイルそのものは消えない（ComfyUI にファイルを消す API は無い）。
+        """
+        if self.cloud:
+            return
+        await self._request("POST", "/history", json={"delete": [prompt_id]}, timeout=5.0)
+
     async def download(self, image: dict, dest: str | Path) -> Path:
         dest = Path(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)

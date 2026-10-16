@@ -113,12 +113,16 @@ export const api = {
   },
 
   generate: (req: GenerateRequest) => request<Job>('POST', '/api/jobs', req),
-  jobs: (limit = 50) => request<{ jobs: Job[] }>('GET', `/api/jobs?limit=${limit}`),
   job: (id: string) => request<Job>('GET', `/api/jobs/${id}`),
   cancel: (id: string) => request<Job>('POST', `/api/jobs/${id}/cancel`),
-  rerun: (id: string, body: { seed?: number | null; strength?: number; count?: number }) =>
-    request<Job>('POST', `/api/jobs/${id}/rerun`, body),
-  deleteJob: (id: string) => request<{ ok: boolean }>('DELETE', `/api/jobs/${id}`),
+  /** 結果を受け取ったあとで呼ぶ（サーバー側の一時ファイルを消す。履歴は残さない） */
+  discardJob: (id: string) => request<{ ok: boolean }>('DELETE', `/api/jobs/${id}`),
+  /** 画像をブラウザのメモリ（blob: URL）に取り込む */
+  fetchBlobUrl: async (url: string): Promise<string> => {
+    const res = await fetch(url, { credentials: 'same-origin', cache: 'no-store' })
+    if (!res.ok) throw new ApiError(res.status, `画像を受け取れませんでした（HTTP ${res.status}）`)
+    return URL.createObjectURL(await res.blob())
+  },
 
   setup: () => request<SetupStatus>('GET', '/api/setup'),
   setupDownload: (key: string) => request<SetupDownload>('POST', `/api/setup/download/${key}`),
