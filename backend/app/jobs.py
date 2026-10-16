@@ -6,9 +6,7 @@
   /history（Comfy Cloud は /api/jobs）をポーリング → 結果を一時フォルダ（data/tmp/jobs/<id>/）に受け取る。
 - **履歴を残さない**: ジョブはメモリにだけ持つ。ブラウザが結果を受け取ったら ``DELETE /api/jobs/{id}``
   で一時ファイルごと消す。受け取られなくても、終わってから ``JOB_TTL`` 秒で消す。アプリの起動時には
-  一時フォルダを空にする。ComfyUI 側に残る生成画像・アップロードした画像は、``COMFY_OUTPUT_DIR`` /
-  ``COMFY_INPUT_DIR`` が設定されていれば消す（ComfyUI に削除 API が無いため）。履歴（/history）の
-  記録は API で消す。
+  一時フォルダを空にする。ComfyUI 側（output / input / 履歴）には ComfyUI の通常の動作どおり残る。
 - 進捗は ComfyUI の WebSocket の progress を拾う（取れなくても生成はできる）。
 - **中断の自動リトライ**: 同じ ComfyUI を Karakuri Media Studio と共有していると、Karakuri がジョブを
   取り消すときに呼ぶ /interrupt でこちらの実行中のジョブが止まることがある。execution_interrupted を
@@ -32,7 +30,7 @@ from PIL import Image
 from . import images
 from .comfy import (ComfyClient, ComfyError, ComfyExecutionError, ComfyInterrupted, classify_history,
                     error_message, output_images)
-from .config import comfy_input_dir, comfy_output_dir, load_settings, tmp_dir
+from .config import load_settings, tmp_dir
 from .instructions import TargetSpec, build_instruction, is_face_closeup
 from .markers import Person, assign_faces, draw_marks
 from .models import GenerateRequest, SceneSpec
@@ -66,22 +64,6 @@ def jobs_dir() -> Path:
     d = tmp_dir() / "jobs"
     d.mkdir(parents=True, exist_ok=True)
     return d
-
-
-def _remove_inside(base: Path | None, rel: str) -> bool:
-    """base の中の rel を消す（base の外は触らない）。消せたら True。"""
-    if base is None or not rel:
-        return False
-    try:
-        root = base.expanduser().resolve()
-        p = (root / rel).resolve()
-        if root not in p.parents or not p.is_file():
-            return False
-        p.unlink()
-        return True
-    except OSError as exc:
-        log.info("could not remove %s: %s", rel, exc)
-        return False
 
 
 # --------------------------------------------------------------------------- 指示文と A_marked
@@ -337,13 +319,12 @@ class JobManager:
                 seed = int(st["seed"]) + i
                 graph = build_edit(job["prompt"], uploaded, seed, st["model"], st["lora_name"], st["strength"])
                 t0 = time.time()
-                entry, pid = await self._run_one(jid, client, graph, client_id, state, i, st["count"])
+                entry = await self._run_one(jid, client, graph, client_id, state, i, st["count"])
                 imgs = output_images(entry)
                 if not imgs:
                     raise ComfyError("ComfyUI から結果の画像が返ってきませんでした")
                 name = f"out_{i + 1}_seed{seed}.png"
                 await client.download(imgs[0], d / name)
-                await self._cleanup_comfy_output(client, pid, imgs)
                 job["results"].append({"file": name, "seed": seed, "elapsed": round(time.time() - t0, 1)})
                 job["progress"] = (i + 1) / st["count"]
             job.update(status="done", message=None, progress=1.0)
@@ -356,27 +337,11 @@ class JobManager:
             job["finished_at"] = time.time()
             if watcher:
                 watcher.cancel()
-            if client is not None and not client.cloud:
-                for name in uploaded:
-                    _remove_inside(comfy_input_dir(), name)
             self.cancel_flags.discard(jid)
             self.current_pid.pop(jid, None)
 
-    async def _cleanup_comfy_output(self, client: ComfyClient, pid: str, imgs: list[dict]) -> None:
-        """ComfyUI 側に残った結果を消す（ローカルのみ。ファイルは output フォルダの設定があるときだけ）。"""
-        if client.cloud:
-            return
-        for im in imgs:
-            if im.get("type", "output") == "output":
-                sub = im.get("subfolder") or ""
-                _remove_inside(comfy_output_dir(), f"{sub}/{im['filename']}" if sub else im["filename"])
-        try:
-            await client.delete_history(pid)
-        except ComfyError as exc:
-            log.info("could not delete ComfyUI history %s: %s", pid, exc)
-
     async def _run_one(self, jid: str, client: ComfyClient, graph: dict, client_id: str, state: dict,
-                       index: int, count: int) -> tuple[dict, str]:
+                       index: int, count: int) -> dict:
         """1 枚ぶん。中断されたら（自分で取り消したのでなければ）間隔を空けて投げ直す。"""
         job = self.jobs[jid]
         attempt = 0
@@ -389,7 +354,7 @@ class JobManager:
             self.current_pid[jid] = (client, pid)
             job["message"] = f"{label}を生成中" + (f"（投げ直し {attempt}/{MAX_RETRIES}）" if attempt else "")
             try:
-                return await self._wait(jid, client, pid, label), pid
+                return await self._wait(jid, client, pid, label)
             except ComfyInterrupted:
                 if jid in self.cancel_flags:
                     raise JobCancelled()

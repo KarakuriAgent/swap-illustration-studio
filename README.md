@@ -189,13 +189,8 @@ A_marked は `backend/app/markers.py` が Pillow で描きます（学習時の 
 - 画面には今回のセッションの結果だけが出ます。リロードすると消えるので、残したい画像は「保存する」でダウンロードしてください
 - 残すのは設定（`data/settings.json`）、セットアップの状況（`data/downloads.json`）、検出モデル（`data/detector/`）だけです
 
-**ComfyUI 側に残るもの**
-
-- ComfyUI の履歴（`/history`）の記録は、結果を受け取ったあとで API で消します（ローカルのみ）
-- ComfyUI には**ファイルを消す API が無い**ため、生成画像（ComfyUI の `output/swap_studio/`）とアップロードした画像
-  （`input/swap_studio/`）は、そのままでは ComfyUI 側に残ります。`.env` に `COMFY_OUTPUT_DIR` / `COMFY_INPUT_DIR`
-  （ComfyUI の output / input フォルダの絶対パス）を書くと、結果を受け取ったあとでそれらを消します（Docker では同じ絶対パスでマウントされます）
-- Comfy Cloud では消せません（Cloud 側の保存の扱いは Comfy Cloud の規約に従います）
+**ComfyUI 側**: このアプリの中には残しませんが、ComfyUI 側（output / input フォルダ、ComfyUI の履歴）には
+ComfyUI の通常の動作どおり残ります（Comfy Cloud も同様に Cloud 側の扱いに従います）。
 
 ## 人物・顔の自動検出
 
@@ -231,7 +226,6 @@ Hugging Face から `data/detector/` に取得。リビジョン固定・SHA-256
 | `COMFY_CLOUD_API_KEY` | なし | Comfy Cloud の API キー（画面からも設定可） |
 | `HF_TOKEN` | なし | Hugging Face のトークン（任意） |
 | `LORA_HF_REPO` / `LORA_SHA256` | Kohei-Yamashita/swap-illustration-lora / 0e51ca1e… | LoRA の取得元と検証用ハッシュ |
-| `COMFY_OUTPUT_DIR` / `COMFY_INPUT_DIR` | なし | ComfyUI の output / input フォルダ（設定すると、ComfyUI 側に残る画像を消す） |
 | `SWAP_DATA_DIR` | `./data` | 設定・検出モデル・一時ファイルの置き場 |
 
 画面の設定（実行先・LoRA のファイル名・API キーなど）は `data/settings.json`（git 管理外）に保存されます。

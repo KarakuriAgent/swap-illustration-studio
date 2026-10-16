@@ -15,7 +15,7 @@ def tmp_data(tmp_path, monkeypatch):
     from app import jobs, model_setup
 
     monkeypatch.setenv("SWAP_DATA_DIR", str(tmp_path / "data"))
-    for k in ("COMFY_MODELS_DIR", "COMFY_OUTPUT_DIR", "COMFY_INPUT_DIR", "ACCESS_TOKEN", "SWAP_BIND_HOST",
+    for k in ("COMFY_MODELS_DIR", "ACCESS_TOKEN", "SWAP_BIND_HOST",
               "REQUIRE_TOKEN", "COMFY_CLOUD_API_KEY", "HF_TOKEN", "LORA_HF_REPO", "LORA_SHA256", "COMFY_URL"):
         monkeypatch.delenv(k, raising=False)
     model_setup._state.clear()

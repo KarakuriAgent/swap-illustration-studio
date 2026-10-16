@@ -29,7 +29,6 @@ class FakeClient:
         self.queued = []
         self.uploaded = []
         self.cancelled = []
-        self.history_deleted = []
 
     async def upload_image(self, path, subfolder="swap_studio"):
         self.uploaded.append(path.name)
@@ -54,9 +53,6 @@ class FakeClient:
 
     async def cancel(self, pid):
         self.cancelled.append(pid)
-
-    async def delete_history(self, pid):
-        self.history_deleted.append(pid)
 
     async def download(self, image, dest):
         dest.write_bytes(_png((40, 30)))
@@ -159,33 +155,6 @@ async def test_discard_and_ttl_remove_temp_files(req, monkeypatch):
     assert m.sweep() == []               # まだ期限内
     assert m.sweep(now=time.time() + jobs.JOB_TTL + 1) == [job2["id"]]
     assert not (jobs.jobs_dir() / job2["id"]).exists()
-
-
-async def test_comfy_output_and_input_removed(req, tmp_path, monkeypatch):
-    out_dir = tmp_path / "comfy_out"
-    in_dir = tmp_path / "comfy_in" / "swap_studio"
-    out_dir.mkdir()
-    in_dir.mkdir(parents=True)
-    monkeypatch.setenv("COMFY_OUTPUT_DIR", str(out_dir))
-    monkeypatch.setenv("COMFY_INPUT_DIR", str(tmp_path / "comfy_in"))
-
-    class Fake(FakeClient):
-        async def upload_image(self, path, subfolder="swap_studio"):
-            (in_dir / path.name).write_bytes(b"x")
-            return await super().upload_image(path, subfolder)
-
-        async def history(self, pid):
-            (out_dir / f"{pid}.png").write_bytes(b"png")
-            return await super().history(pid)
-
-    m = jobs.JobManager()
-    job = m.submit(req)
-    fake = Fake(["success", "success"])
-    await m.run_job(m.jobs[job["id"]], client=fake)
-    assert m.jobs[job["id"]]["status"] == "done"
-    assert list(out_dir.iterdir()) == []          # ComfyUI の output に残った結果を消した
-    assert list(in_dir.iterdir()) == []           # アップロードした画像も消した
-    assert fake.history_deleted == ["p1", "p2"]   # ComfyUI の履歴の記録も消した
 
 
 def test_startup_cleanup_removes_legacy_history(tmp_data):

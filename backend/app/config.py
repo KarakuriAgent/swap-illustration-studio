@@ -60,23 +60,6 @@ def tmp_dir() -> Path:
     return d
 
 
-def _env_path(name: str) -> Path | None:
-    raw = _env(name)
-    return Path(raw).expanduser() if raw else None
-
-
-def comfy_output_dir() -> Path | None:
-    """ローカル ComfyUI の output フォルダ（``COMFY_OUTPUT_DIR``）。設定されていれば、
-    結果を受け取ったあとに ComfyUI 側に残った生成画像を消す（ComfyUI に削除 API が無いため）。"""
-    return _env_path("COMFY_OUTPUT_DIR")
-
-
-def comfy_input_dir() -> Path | None:
-    """ローカル ComfyUI の input フォルダ（``COMFY_INPUT_DIR``）。設定されていれば、
-    アップロードした A_marked・B をジョブのあとで消す。"""
-    return _env_path("COMFY_INPUT_DIR")
-
-
 def comfy_models_dir() -> Path | None:
     """ローカル ComfyUI の models フォルダ（``COMFY_MODELS_DIR``。未設定なら None）。
 
