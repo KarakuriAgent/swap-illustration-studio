@@ -1,0 +1,47 @@
+# Swap Illustration Studio を Docker で動かす。
+#
+#   ./compose.sh up -d --build     # 起動（http://127.0.0.1:2760）
+#   ./compose.sh logs -f           # ログ
+#   ./compose.sh down              # 停止
+#
+# - 設定は .env（.env.example を写して編集）。HOST / PORT はホスト側の公開先。
+#   HOST を 127.0.0.1 以外（0.0.0.0 など）にすると LAN から使えるが、ACCESS_TOKEN が必須になる。
+# - データ（履歴 DB・画像・設定・ダウンロード状況）は ./data に置く（コンテナを作り直しても残る）。
+# - ローカルの ComfyUI は既定で http://host.docker.internal:8188（ホストの ComfyUI）。ComfyUI が
+#   127.0.0.1 だけで待ち受けているとコンテナから届かないので、--listen 0.0.0.0 などで起動しておく。
+# - セットアップ（モデル・LoRA のダウンロード）を使うなら .env の COMFY_MODELS_DIR に ComfyUI の models
+#   フォルダの絶対パスを書く。コンテナにも同じ絶対パスでマウントする。ダウンロードは <名前>.part に
+#   書いていくので、途中でコンテナが止まっても次の起動で続きから再開する。
+# - `user:` にローカルユーザーの UID:GID を渡す（作られるファイルの所有者をローカルユーザーにする）。
+#   compose.sh が自動で渡す。
+name: swap-illustration-studio
+
+services:
+  swap-illustration-studio:
+    build:
+      context: .
+      # ビルド中に DNS が引けない環境があるため、ホストのネットワークを使う
+      network: host
+    image: swap-illustration-studio:latest
+    user: "${UID:-1000}:${GID:-1000}"
+    environment:
+      SWAP_BIND_HOST: ${HOST:-127.0.0.1}
+      ACCESS_TOKEN: ${ACCESS_TOKEN:-}
+      REQUIRE_TOKEN: ${REQUIRE_TOKEN:-}
+      COMFY_URL: ${DOCKER_COMFY_URL:-http://host.docker.internal:8188}
+      COMFY_CLOUD_API_KEY: ${COMFY_CLOUD_API_KEY:-}
+      HF_TOKEN: ${HF_TOKEN:-}
+      LORA_HF_REPO: ${LORA_HF_REPO:-}
+      LORA_SHA256: ${LORA_SHA256:-}
+      COMFY_MODELS_DIR: ${COMFY_MODELS_DIR:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "${HOST:-127.0.0.1}:${PORT:-2760}:2760"
+    volumes:
+      - ./data:/app/data
+      # ComfyUI の models フォルダ（同じ絶対パスでマウント）。未設定なら無害なダミー
+      - ${COMFY_MODELS_DIR:-/tmp/swap-studio-no-models-dir}:${COMFY_MODELS_DIR:-/tmp/swap-studio-no-models-dir}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    init: true
+    restart: unless-stopped

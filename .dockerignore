@@ -1,0 +1,13 @@
+.git
+.env
+.env.*
+.venv
+data
+**/node_modules
+frontend/dist
+**/__pycache__
+**/.pytest_cache
+backend/tests
+*.part
+*.safetensors
+*.onnx

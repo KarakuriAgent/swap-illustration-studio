@@ -1,0 +1,165 @@
+"""ジョブの実行（ComfyUI は偽物）: 中断の自動リトライ、エラー、取り消し、再生成。"""
+
+from __future__ import annotations
+
+import io
+
+import pytest
+from PIL import Image
+
+from app import db, images, jobs
+from app.models import GenerateRequest, RerunRequest
+
+
+def _png(size=(400, 300), color=(200, 220, 240)) -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", size, color).save(buf, "PNG")
+    return buf.getvalue()
+
+
+class FakeClient:
+    """ComfyClient の代わり。history の返り値を順に返す。"""
+
+    cloud = False
+    base_url = "http://fake:8188"
+
+    def __init__(self, script):
+        self.script = list(script)    # 投入ごとの結果: "interrupted" / "success" / "error"
+        self.queued = []
+        self.uploaded = []
+        self.cancelled = []
+
+    async def upload_image(self, path, subfolder="swap_studio"):
+        self.uploaded.append(path.name)
+        return f"{subfolder}/{path.name}"
+
+    async def queue_prompt(self, graph, client_id):
+        self.queued.append(graph)
+        return f"p{len(self.queued)}"
+
+    async def history(self, pid):
+        kind = self.script[int(pid[1:]) - 1]
+        if kind == "interrupted":
+            return {"status": {"status_str": "error", "messages": [["execution_interrupted", {}]]}}
+        if kind == "error":
+            return {"status": {"status_str": "error", "messages": [
+                ["execution_error", {"node_type": "KSampler", "exception_message": "CUDA OOM"}]]}}
+        return {"status": {"status_str": "success", "completed": True},
+                "outputs": {"8": {"images": [{"filename": f"{pid}.png", "subfolder": "", "type": "output"}]}}}
+
+    async def queue_state(self):
+        return {"running": [], "pending": []}
+
+    async def cancel(self, pid):
+        self.cancelled.append(pid)
+
+    async def download(self, image, dest):
+        dest.write_bytes(_png((40, 30)))
+        return dest
+
+    async def watch_progress(self, client_id, cb):
+        return None
+
+
+@pytest.fixture
+def req():
+    a = images.save_upload(_png((400, 300)))
+    b1 = images.save_upload(_png((100, 200), (255, 0, 0)))
+    b2 = images.save_upload(_png((100, 200), (0, 0, 255)))
+    return GenerateRequest(scene_id=a["id"], refs=[b1["id"], b2["id"]],
+                           targets=[{"box": [10, 20, 150, 290], "ref": 0}, {"box": [220, 20, 380, 290], "ref": 1}],
+                           settings={"seed": 11, "count": 2, "strength": 1.0})
+
+
+@pytest.fixture(autouse=True)
+def fast(monkeypatch):
+    monkeypatch.setattr(jobs, "RETRY_WAIT", 0.0)
+    monkeypatch.setattr(jobs, "POLL_LOCAL", 0.0)
+
+
+async def test_submit_writes_inputs_and_prompt(req):
+    m = jobs.JobManager()
+    job = m.submit(req)
+    assert job["status"] == "queued"
+    assert job["prompt"].startswith("Replace the person circled in red (marker 1) in <image1>")
+    d = jobs.jobs_dir() / job["id"]
+    assert {p.name for p in d.iterdir()} == {"A.png", "A_marked.png", "B1.png", "B2.png"}
+    assert job["settings"]["seed"] == 11 and job["settings"]["lora_name"] == "qwen-image-21/anime-swap.safetensors"
+    # A_marked には赤い線が入っている
+    marked = Image.open(d / "A_marked.png").convert("RGB")
+    assert any(px[0] > 200 and px[1] < 60 for px in marked.getdata())
+
+
+async def test_interrupted_is_retried(req):
+    m = jobs.JobManager()
+    job = m.submit(req)
+    fake = FakeClient(["interrupted", "interrupted", "success", "success"])
+    await m.run_job(db.get_job(job["id"]), client=fake)
+    done = db.get_job(job["id"])
+    assert done["status"] == "done", done["error"]
+    assert [r["seed"] for r in done["results"]] == [11, 12]
+    assert len(fake.queued) == 4
+    # 投げ直しも同じシード、2 枚目は +1
+    assert [g["6"]["inputs"]["seed"] for g in fake.queued] == [11, 11, 11, 12]
+    # A_marked, B1, B2 の順にアップロード
+    assert [n.split("_", 2)[-1] for n in fake.uploaded] == ["canvas.png", "B1.png", "B2.png"]
+    g = fake.queued[0]
+    assert g["20"]["inputs"]["lora_name"] == "qwen-image-21/anime-swap.safetensors"
+    for r in done["results"]:
+        assert (jobs.jobs_dir() / job["id"] / r["file"]).is_file()
+
+
+async def test_gives_up_after_max_retries(req, monkeypatch):
+    monkeypatch.setattr(jobs, "MAX_RETRIES", 2)
+    m = jobs.JobManager()
+    job = m.submit(req)
+    await m.run_job(db.get_job(job["id"]), client=FakeClient(["interrupted"] * 10))
+    done = db.get_job(job["id"])
+    assert done["status"] == "error"
+    assert "中断" in done["error"]
+
+
+async def test_execution_error_is_reported(req):
+    m = jobs.JobManager()
+    job = m.submit(req)
+    await m.run_job(db.get_job(job["id"]), client=FakeClient(["error"]))
+    done = db.get_job(job["id"])
+    assert done["status"] == "error" and "CUDA OOM" in done["error"]
+
+
+async def test_own_cancel_is_not_retried(req):
+    m = jobs.JobManager()
+    job = m.submit(req)
+    fake = FakeClient(["interrupted", "success", "success"])
+    m.cancel_flags.add(job["id"])   # こちらが取り消した
+    await m.run_job(db.get_job(job["id"]), client=fake)
+    assert db.get_job(job["id"])["status"] == "cancelled"
+
+
+async def test_rerun_copies_inputs(req):
+    m = jobs.JobManager()
+    job = m.submit(req)
+    re = m.rerun(job["id"], RerunRequest(seed=99, strength=0.8, count=1))
+    assert re["parent_id"] == job["id"] and re["prompt"] == job["prompt"]
+    assert re["settings"]["seed"] == 99 and re["settings"]["strength"] == 0.8 and re["settings"]["count"] == 1
+    assert (jobs.jobs_dir() / re["id"] / "A_marked.png").is_file()
+
+
+async def test_position_mode_sends_plain_a(req):
+    req.mode = "position"
+    m = jobs.JobManager()
+    job = m.submit(req)
+    assert job["inputs"]["canvas"].endswith("/A.png")
+    assert job["prompt"].startswith("In <image1>, replace the person on the left with the person from <image2>")
+
+
+def test_prompt_override(req):
+    req.prompt_override = "custom text"
+    job = jobs.JobManager().submit(req)
+    assert job["prompt"] == "custom text" and job["settings"]["prompt_edited"]
+
+
+def test_bad_ref_rejected(req):
+    req.targets[1].ref = 3
+    with pytest.raises(ValueError):
+        jobs.JobManager().submit(req)

@@ -1,0 +1,28 @@
+# 秘密情報・ローカル設定
+.env
+.env.*
+!.env.example
+
+# データ（履歴 DB・画像・設定・検出モデル）
+/data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Node / ビルド成果物
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+
+# ダウンロード途中のファイル・モデル
+*.part
+*.safetensors
+*.onnx
+
+# OS / エディタ
+.DS_Store
+.vscode/
+.idea/
